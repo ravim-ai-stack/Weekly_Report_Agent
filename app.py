@@ -1,13 +1,13 @@
 """DataPattern Weekly Report Agent - consolidates raw weekly notes into the
 DataPattern weekly status report PPT (slide 9 only) and emails it out."""
 
-import glob
+import io
 import os
 import re
 import uuid
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, render_template, request, send_from_directory
+from flask import Flask, jsonify, redirect, render_template, request, send_file
 
 from modules.weekly_report.hmh_builder import build_hmh_report
 from modules.weekly_report.llm_consolidate import consolidate_notes, reclassify_milestones_by_status
@@ -22,6 +22,7 @@ from modules.weekly_report.medtronic_timesheet import (
 )
 from modules.weekly_report.phibro_status_builder import build_phibro_status_report
 from modules.weekly_report.pptx_builder import build_report
+from modules.weekly_report.reports_store import latest_report_matching, load_report, save_report
 from modules.weekly_report.teams_config import DEFAULT_LAYOUT, MEDTRONIC_TEAM, PROJECT_LAYOUTS, TEAMS, get_report_config
 from modules.weekly_report.updates_store import add_entry, get_entries, remove_entry
 from modules.weekly_report.week_utils import format_date_range
@@ -30,10 +31,7 @@ load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "template")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 CLIENT_NAME = "Nova Biomedical"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
@@ -41,15 +39,18 @@ app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_\-. ]+\.(pptx|docx|xlsx)$")
 
 
-def _resolve_medtronic_source(template_path: str, client_name: str) -> str:
+def _resolve_medtronic_source(template_path: str, client_name: str) -> io.BytesIO:
     """Medtronic's report is one growing document - each generation must
     build on top of whatever was generated last time (so earlier weeks are
-    preserved), not restart from the frozen template. Returns the most
-    recently generated Medtronic output file, or template_path on the very
-    first generation."""
-    pattern = os.path.join(OUTPUT_DIR, f"DataPattern_{client_name}_Engagement_*.docx")
-    candidates = sorted(glob.glob(pattern))
-    return candidates[-1] if candidates else template_path
+    preserved), not restart from the frozen template. Returns a BytesIO of
+    the most recently generated Medtronic report, or of the frozen
+    template on the very first generation."""
+    latest = latest_report_matching(f"DataPattern_{client_name}_Engagement_")
+    if latest:
+        _, data = latest
+        return io.BytesIO(data)
+    with open(template_path, "rb") as f:
+        return io.BytesIO(f.read())
 
 
 @app.route("/")
@@ -317,7 +318,7 @@ def api_generate():
     file_ext = config.get("file_ext", "pptx")
     filename = f"DataPattern_{client_name}_Engagement_{week.get('start', uuid.uuid4().hex[:8])}.{file_ext}"
     filename = re.sub(r"[^A-Za-z0-9_.\- ]", "", filename)
-    output_path = os.path.join(OUTPUT_DIR, filename)
+    output_buf = io.BytesIO()
 
     reclassify_milestones_by_status(report)
 
@@ -330,17 +331,18 @@ def api_generate():
         # separate from "layout" for that case.
         builder = config.get("builder", config.get("layout"))
         if builder == "medtronic":
-            source_path = _resolve_medtronic_source(template_path, client_name)
-            build_medtronic_report(source_path, output_path, week, report)
+            source = _resolve_medtronic_source(template_path, client_name)
+            build_medtronic_report(source, output_buf, week, report)
         elif builder == "hmh":
-            build_hmh_report(template_path, output_path, week, report)
+            build_hmh_report(template_path, output_buf, week, report)
         elif builder == "phibro_status":
-            build_phibro_status_report(template_path, output_path, week, report)
+            build_phibro_status_report(template_path, output_buf, week, report)
         else:
-            build_report(template_path, output_path, week, report, slide_index=config["slide_index"])
+            build_report(template_path, output_buf, week, report, slide_index=config["slide_index"])
     except Exception as exc:
         return jsonify(success=False, error=f"Failed to generate the report: {exc}"), 500
 
+    save_report(filename, output_buf.getvalue())
     return jsonify(success=True, filename=filename, download_url=f"/download/{filename}")
 
 
@@ -348,7 +350,11 @@ def api_generate():
 def download(filename):
     if not SAFE_FILENAME_RE.match(filename):
         return jsonify(success=False, error="Invalid filename."), 400
-    return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
+    result = load_report(filename)
+    if result is None:
+        return jsonify(success=False, error="Generated file was not found. Please generate it again."), 404
+    data, content_type = result
+    return send_file(io.BytesIO(data), mimetype=content_type, as_attachment=True, download_name=filename)
 
 
 @app.route("/api/send-email", methods=["POST"])
@@ -359,12 +365,10 @@ def api_send_email():
     if not filename or not SAFE_FILENAME_RE.match(filename):
         return jsonify(success=False, message="Missing or invalid report file. Please generate the report again."), 400
 
-    file_path = os.path.join(OUTPUT_DIR, filename)
-    if not os.path.isfile(file_path):
+    result = load_report(filename)
+    if result is None:
         return jsonify(success=False, message="Generated report file was not found. Please generate it again."), 404
-
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
+    file_bytes, _ = result
 
     result = dispatch_report_email(
         recipient_email=data.get("recipient_email", ""),

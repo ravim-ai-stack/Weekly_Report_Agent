@@ -1,10 +1,10 @@
 """Builds/maintains the single, continuously-updated Medtronic daily
-timesheet workbook (output/Medtronic_Time_Sheet.xlsx) from the
-timesheet_entries table (see db/schema.sql). Every save rebuilds the whole
-workbook from that store rather than surgically editing the previous
-.xlsx - far less error-prone than shifting merged cell ranges by hand, and
-the result is identical either way since the store is the single source of
-truth.
+timesheet workbook (stored as a blob under WORKBOOK_FILENAME - see
+reports_store.py) from the timesheet_entries table (see db/schema.sql).
+Every save rebuilds the whole workbook from that store rather than
+surgically editing the previous .xlsx - far less error-prone than
+shifting merged cell ranges by hand, and the result is identical either
+way since the store is the single source of truth.
 
 Layout mirrors the "check" reference sheet in
 template/Medtronic_Time_Sheet.xlsx (that sheet is only ever read, never
@@ -15,7 +15,7 @@ hours" row. Weeks are stacked newest-first; days within a week are
 chronological, matching the Medtronic weekly status docx's "newest week on
 top" convention."""
 
-import os
+import io
 from datetime import datetime, timedelta
 
 import psycopg2.extras
@@ -24,12 +24,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 from .db import get_connection
 from .llm_consolidate import consolidate_notes
+from .reports_store import save_report
 
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.dirname(os.path.dirname(_THIS_DIR))
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-
-WORKBOOK_PATH = os.path.join(OUTPUT_DIR, "Medtronic_Time_Sheet.xlsx")
 WORKBOOK_FILENAME = "Medtronic_Time_Sheet.xlsx"
 SHEET_NAME = "Medtronic Time Sheet"
 
@@ -208,8 +204,9 @@ def _rebuild_workbook(entries: list) -> None:
         _write_total_row(ws, row, week_total)
         row += 1
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    wb.save(WORKBOOK_PATH)
+    buf = io.BytesIO()
+    wb.save(buf)
+    save_report(WORKBOOK_FILENAME, buf.getvalue())
 
 
 def _parse_range(start_iso: str, end_iso: str):
@@ -239,7 +236,7 @@ def build_range_workbook(start_iso: str, end_iso: str) -> str:
     inclusive, laid out as a single continuous table - one range banner up
     top, then every date in the range one after another with no per-week
     'Reporting Date' banners in between, and one grand total at the bottom.
-    Returns the generated file's basename in OUTPUT_DIR."""
+    Returns the generated file's stored filename."""
     start_d, end_d = _parse_range(start_iso, end_iso)
     entries = _load_entries()
 
@@ -258,8 +255,9 @@ def build_range_workbook(start_iso: str, end_iso: str) -> str:
     _write_total_row(ws, row, total)
 
     filename = f"Medtronic_Time_Sheet_{start_d.isoformat()}_to_{end_d.isoformat()}.xlsx"
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    wb.save(os.path.join(OUTPUT_DIR, filename))
+    buf = io.BytesIO()
+    wb.save(buf)
+    save_report(filename, buf.getvalue())
     return filename
 
 

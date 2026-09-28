@@ -83,3 +83,15 @@ CREATE TABLE IF NOT EXISTS timesheet_entries (
 
 CREATE INDEX IF NOT EXISTS idx_timesheet_entries_date
     ON timesheet_entries (entry_date);
+
+-- Generated report/workbook files (pptx/docx/xlsx), stored as blobs
+-- rather than under output/ - see reports_store.py. Needed for Vercel:
+-- its serverless filesystem is read-only/ephemeral, so a file written by
+-- one request can't be assumed to exist for a later one (including
+-- Medtronic's "build the next week on top of last week's file" pattern).
+CREATE TABLE IF NOT EXISTS generated_reports (
+    filename      TEXT PRIMARY KEY,
+    content_type  TEXT NOT NULL,
+    file_bytes    BYTEA NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
