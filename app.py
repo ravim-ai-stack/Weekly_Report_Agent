@@ -5,6 +5,7 @@ import io
 import os
 import re
 import uuid
+from urllib.parse import unquote
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, render_template, request, send_file
@@ -348,6 +349,11 @@ def api_generate():
 
 @app.route("/download/<path:filename>")
 def download(filename):
+    # Vercel's routing passes the path segment through still
+    # percent-encoded (e.g. literal "%20" instead of a space) instead of
+    # decoding it the way Werkzeug's own dev server does - unquote() is a
+    # no-op on an already-decoded filename, so this is safe either way.
+    filename = unquote(filename)
     if not SAFE_FILENAME_RE.match(filename):
         return jsonify(success=False, error="Invalid filename."), 400
     result = load_report(filename)
